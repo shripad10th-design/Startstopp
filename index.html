@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>STOPP/START v3 — Mobile Optimized</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;background:#f7fbfd;margin:0;padding:18px;color:#0f1724}
+  .container{max-width:980px;margin:0 auto}
+  h1{color:#0f5678;margin-bottom:6px}
+  fieldset{background:#fff;border:1px solid #e6eef6;padding:12px;border-radius:8px;margin-bottom:12px}
+  legend{font-weight:700;color:#0f5678;padding:0 6px}
+  label{display:block;margin:8px 0}
+  input,textarea,select,button{font-size:14px}
+  textarea{width:100%;min-height:120px;padding:8px;border:1px solid #dbe7ef;border-radius:6px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .btn{background:#0f5678;color:#fff;padding:8px 12px;border-radius:6px;border:0;cursor:pointer}
+  .btn.ghost{background:transparent;color:#0f5678;border:1px solid #dbe7ef}
+  .status{font-size:13px;color:#334155;margin-top:8px}
+  .preview{display:flex;gap:12px;margin-top:10px;align-items:flex-start}
+  .preview img{max-width:220px;border-radius:6px;border:1px solid #eef6fb}
+  .ocrText{white-space:pre-wrap;background:#fbfdff;padding:8px;border-radius:6px;border:1px solid #eef6fb;max-height:180px;overflow:auto}
+  .card{background:#fff;border:1px solid #e6eef6;padding:12px;border-radius:8px;margin-top:12px}
+  .card h3{margin:0 0 8px}
+  ul{margin:6px 0 0 18px}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#0f5678;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .note{font-size:13px;color:#475569;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>STOPP/START v3 — Mobile Optimized</h1>
+  <div class="note">OCR + Lightweight STOPP/START v3 analysis. Works best on clear photos of prescriptions.</div>
+
+  <fieldset>
+    <legend>Patient details</legend>
+    <label>Age: <input id="age" type="number" placeholder="e.g., 75"></label>
+    <label>Renal/eGFR: <input id="egfr" placeholder="e.g., 45"></label>
+    <label>Blood Pressure: <input id="bp" placeholder="e.g., 160/90"></label>
+    <label>Frailty: <select id="frailty"><option value="">Skip</option><option>none</option><option>moderate</option><option>severe</option></select></label>
+    <label>Comorbidities: <input id="comorbidities" placeholder="e.g., vascular disease, diabetes"></label>
+    <label>Allergies: <input id="allergies" placeholder="e.g., aspirin"></label>
+    <label>History: <input id="history" placeholder="e.g., falls, stroke, GI bleed"></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Prescription input (type, upload photo, or voice)</legend>
+    <textarea id="prescriptionInput" placeholder="OCR/voice results will appear here"></textarea>
+
+    <div class="controls">
+      <button id="checkBtn" class="btn">Check</button>
+      <label class="btn ghost">📁 Upload<input id="fileInput" type="file" accept="image/*" style="display:none"></label>
+      <button id="voiceBtn" class="btn ghost">🎤 Voice</button>
+      <button id="exportJson" class="btn ghost">Export JSON</button>
+      <button id="exportPdf" class="btn ghost">Export PDF</button>
+    </div>
+
+    <div class="preview" id="previewArea" style="display:none">
+      <img id="previewImg" src="" alt="preview" />
+      <div style="flex:1">
+        <div class="small">OCR / Transcribed text (editable)</div>
+        <div id="ocrText" class="ocrText"></div>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </fieldset>
+
+  <div class="card">
+    <h3>Analysis</h3>
+    <div id="patientInfo" class="note">No patient data</div>
+    <div id="stoppArea"><strong>STOPP:</strong><div id="stoppList">—</div></div>
+    <div id="startArea"><strong>START:</strong><div id="startList">—</div></div>
+    <div id="adrArea"><strong>ADRs & Adherence:</strong><div id="adrList">—</div></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+// Simplified lightweight STOPP rules (examples only, extendable)
+const stoppRules=[
+  {id:'STOPP C1',drug:'aspirin',check:c=>c.doses['aspirin']&&c.doses['aspirin']>100,msg:'Aspirin >100mg/day increases bleeding risk.'},
+  {id:'STOPP B1',drug:'digoxin',check:c=>c.doses['digoxin']&&c.doses['digoxin']>0.125&&(c.age>=70||c.egfr<30),msg:'Digoxin >0.125mg/day in age ≥70 or low eGFR.'},
+  {id:'STOPP D8',drug:'diazepam',check:c=>c.prescription.includes('diazepam'),msg:'Benzodiazepines >4 weeks inappropriate.'}
+];
+
+// Simplified lightweight START rules
+const startRules=[
+  {id:'START B2',cond:c=>c.comorbidities.includes('vascular')&&!c.prescription.includes('statin'),msg:'Consider statin for vascular disease.'},
+  {id:'START B3',cond:c=>c.comorbidities.includes('coronary')&&!c.prescription.includes('ace')&&!c.prescription.includes('arb'),msg:'Consider ACE inhibitor/ARB for CAD.'}
+];
+
+const adrDatabase={
+  'digoxin':['Nausea','Bradycardia'],
+  'aspirin':['GI bleed','Gastric irritation'],
+  'morphine':['Constipation','Respiratory depression']
+};
+
+const adherenceRules=[
+  {id:'A1',trig:['morphine','oxycodone','tramadol','opioid'],supports:['laxative','senna','macrogol','docusate'],msg:'Opioid prescribed without a laxative — constipation risk.'}
+];
+
+function norm(s){ return (s||'').toLowerCase(); }
+function splitList(s){ return s.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean); }
+function extractDose(drug, raw){ try{ const re=new RegExp(drug+'[^0-9]*([0-9]+\.?[0-9]*)','i'); const m=raw.match(re); return m?parseFloat(m[1]):null; }catch(e){return null;} }
+
+function buildContext(raw){
+  const ctx={
+    prescription: norm(raw),
+    doses:{},
+    age:parseInt(document.getElementById('age').value)||null,
+    egfr:parseInt(document.getElementById('egfr').value)||null,
+    comorbidities: norm(document.getElementById('comorbidities').value||''),
+    allergies: norm(document.getElementById('allergies').value||''),
+    history: norm(document.getElementById('history').value||''),
+    timestamp:new Date().toISOString()
+  };
+  ['aspirin','digoxin','morphine','diazepam','lorazepam','alprazolam','oxycodone'].forEach(d=>{
+    const dose=extractDose(d, raw);
+    if(dose!==null) ctx.doses[d]=dose;
+  });
+  if(ctx.prescription.includes('opioid')) ctx.doses['opioid']=1;
+  return ctx;
+}
+
+function analyzeAndRender(raw){
+  const ctx=buildContext(raw);
+  document.getElementById('patientInfo').textContent=`Age: ${ctx.age||'-'} • eGFR: ${ctx.egfr||'-'} • Comorbidities: ${ctx.comorbidities||'-'} • Allergies: ${ctx.allergies||'-'} • Time: ${ctx.timestamp}`;
+  const stoppFound=[];
+  stoppRules.forEach(r=>{ try{ if(r.check(ctx)) stoppFound.push(`${r.id}: ${r.msg}`);}catch(e){} });
+  document.getElementById('stoppList').innerHTML=stoppFound.length?('<ul>'+stoppFound.map(x=>`<li>${x}</li>`).join('')+'</ul>'):'None';
+  const startFound=[]; startRules.forEach(r=>{ try{ if(r.cond(ctx)) startFound.push(`${r.id}: ${r.msg}`);}catch(e){} });
+  document.getElementById('startList').innerHTML=startFound.length?('<ul>'+startFound.map(x=>`<li>${x}</li>`).join('')+'</ul>'):'None';
+  const adrFound=[]; Object.keys(adrDatabase).forEach(d=>{ if(ctx.prescription.includes(d)) adrFound.push(`${d.toUpperCase()}: ${adrDatabase[d].join('; ')}`); });
+  const adhFound=[]; adherenceRules.forEach(r=>{ if(r.trig.some(t=>ctx.prescription.includes(t))&&!r.supports.some(s=>ctx.prescription.includes(s))) adhFound.push(r.msg); });
+  const combined=adrFound.concat(adhFound);
+  document.getElementById('adrList').innerHTML=combined.length?('<ul>'+combined.map(x=>`<li>${x}</li>`).join('')+'</ul>'):'None';
+  window._lastAnalysis={ctx,stoppFound,startFound,adrFound,adhFound};
+}
+
+document.getElementById('checkBtn').addEventListener('click',()=>{
+  const text=document.getElementById('prescriptionInput').value.trim();
+  if(!text) return alert('Enter or provide a prescription first.');
+  analyzeAndRender(text);
+});
+
+// OCR with Tesseract.js v5
+document.getElementById('fileInput').addEventListener('change',async(e)=>{
+  const f=e.target.files&&e.target.files[0]; if(!f) return;
+  document.getElementById('previewImg').src=URL.createObjectURL(f); document.getElementById('previewArea').style.display='flex';
+  document.getElementById('status').innerHTML='<span class="spinner"></span>Running OCR...';
+  try{
+    const {data:{text}}=await Tesseract.recognize(f,'eng',{logger:m=>{ if(m.status&&m.progress!=null){ document.getElementById('status').innerHTML=`<span class="spinner"></span>OCR: ${m.status} ${Math.round(m.progress*100)}%`; } }});
+    document.getElementById('ocrText').textContent=text;
+    document.getElementById('prescriptionInput').value=text;
+    analyzeAndRender(text);
+    document.getElementById('status').textContent='OCR complete.';
+  }catch(e){ document.getElementById('status').textContent='OCR failed: '+(e.message||e); }
+});
+
+// Voice input
+document.getElementById('voiceBtn').addEventListener('click',()=>{
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR) return alert('Voice not supported in this browser.');
+  const r=new SR(); r.lang='en-US'; r.interimResults=false; r.maxAlternatives=1;
+  r.onstart=()=>document.getElementById('status').textContent='Listening...';
+  r.onresult=(e)=>{ const t=e.results[0][0].transcript; document.getElementById('ocrText').textContent=t; document.getElementById('prescriptionInput').value=t; analyzeAndRender(t); document.getElementById('status').textContent='Voice input complete.'; };
+  r.onerror=(ev)=>document.getElementById('status').textContent='Voice error: '+(ev.error||ev.message||ev);
+  r.start();
+});
+
+// Export JSON
+document.getElementById('exportJson').addEventListener('click',()=>{
+  if(!window._lastAnalysis) return alert('Run analysis first.');
+  const payload={exportedAt:new Date().toISOString(),analysis:window._lastAnalysis};
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='stopp_start_analysis.json'; a.click(); URL.revokeObjectURL(url);
+});
+
+// Export PDF
+document.getElementById('exportPdf').addEventListener('click',()=>{
+  if(!window._lastAnalysis) return alert('Run analysis first.');
+  const {jsPDF}=window.jspdf; const doc=new jsPDF(); const data=window._lastAnalysis;
+  doc.setFontSize(14); doc.text('STOPP/START Analysis',10,12); doc.setFontSize(10); doc.text('Exported: '+new Date().toISOString(),10,20);
+  let y=28;
+  function add(title,lines){ doc.setFont(undefined,'bold'); doc.text(title,10,y); y+=6; doc.setFont(undefined,'normal'); if(lines.length){ lines.forEach(l=>{ doc.text('- '+l,12,y); y+=6; if(y>270){ doc.addPage(); y=12; } }); } else { doc.text('- None',12,y); y+=6; } y+=4; }
+  add('STOPP',data.stoppFound||[]); add('START',data.startFound||[]); add('ADRs/Adherence',(data.adrFound||[]).concat(data.adhFound||[]));
+  doc.save('stopp_start_analysis.pdf');
+});
+</script>
+</body>
+</html>
